@@ -1,5 +1,3 @@
-# ads_routes.py
-
 from __future__ import annotations
 
 import os
@@ -21,6 +19,8 @@ SP_API_BASE_URL = os.getenv(
     "SP_API_BASE_URL",
     "http://127.0.0.1:8000/v1/pricing"
 )
+
+MAX_HISTORY_DAYS = 95
 
 cache = cache_from_env()
 
@@ -45,6 +45,41 @@ def verify_key(request: Request):
     key = request.headers.get("x-api-key")
     if key != GATEWAY_API_KEY:
         raise HTTPException(status_code=401, detail="invalid api key")
+
+
+# ---------------------------------------------------------------------------
+# Date range validation
+# ---------------------------------------------------------------------------
+def validate_date_range(start_date: str | None, end_date: str | None) -> tuple[str, str]:
+    if not start_date or not end_date:
+        raise HTTPException(
+            status_code=400,
+            detail="Both startDate and endDate are required",
+        )
+
+    try:
+        start = datetime.date.fromisoformat(start_date)
+        end = datetime.date.fromisoformat(end_date)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="startDate and endDate must be in YYYY-MM-DD format",
+        )
+
+    if end < start:
+        raise HTTPException(
+            status_code=400,
+            detail="endDate must be greater than or equal to startDate",
+        )
+
+    day_count = (end - start).days + 1
+    if day_count > MAX_HISTORY_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum supported historical window is {MAX_HISTORY_DAYS} days",
+        )
+
+    return start.isoformat(), end.isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +142,10 @@ def compute_summary_metrics(spapi: dict, ads: dict) -> dict:
         # Preferred normalized schema
         if spapi.get("selected_price") is not None:
             price = spapi.get("selected_price")
-            currency = spapi.get("selected_currency") or spapi.get("currency")
+            currency = (
+                spapi.get("selected_currency")
+                or spapi.get("currency")
+            )
 
         elif spapi.get("sales_price") is not None:
             price = spapi.get("sales_price")
@@ -141,14 +179,14 @@ def compute_summary_metrics(spapi: dict, ads: dict) -> dict:
                             regular_price = first_offer.get("RegularPrice", {})
 
                             price = (
-                                landed_price.get("Amount")
-                                or listing_price.get("Amount")
+                                listing_price.get("Amount")
+                                or landed_price.get("Amount")
                                 or regular_price.get("Amount")
                             )
 
                             currency = (
-                                landed_price.get("CurrencyCode")
-                                or listing_price.get("CurrencyCode")
+                                listing_price.get("CurrencyCode")
+                                or landed_price.get("CurrencyCode")
                                 or regular_price.get("CurrencyCode")
                             )
                 except Exception:
@@ -165,7 +203,7 @@ def compute_summary_metrics(spapi: dict, ads: dict) -> dict:
 
     if spend is not None and sales not in (None, 0):
         try:
-            out["acos"] = float(spend) / float(sales)
+            out["acos"] = round(float(spend) / float(sales), 4)
         except Exception:
             out["acos"] = None
     else:
@@ -175,7 +213,7 @@ def compute_summary_metrics(spapi: dict, ads: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Campaign list (stub)
+# Campaign list
 # ---------------------------------------------------------------------------
 @router.get("/campaigns")
 def get_campaigns(
@@ -212,7 +250,7 @@ def get_campaigns(
 
 
 # ---------------------------------------------------------------------------
-# Report endpoint (stub)
+# Report endpoint (historical range)
 # ---------------------------------------------------------------------------
 @router.get("/report")
 def get_report(
@@ -220,15 +258,18 @@ def get_report(
     region: str,
     profileId: str,
     type: str,
-    date: str,
+    startDate: str,
+    endDate: str,
     ttlSeconds: int = 86400,
 ):
 
     verify_key(request)
+    startDate, endDate = validate_date_range(startDate, endDate)
 
     params = {
         "type": type,
-        "date": date,
+        "startDate": startDate,
+        "endDate": endDate,
     }
 
     cache_key = build_cache_key(
@@ -245,7 +286,8 @@ def get_report(
             region,
             profileId,
             type,
-            date,
+            startDate,
+            endDate,
         ),
     )
 
@@ -274,7 +316,8 @@ def ads_summary(
     sku: str | None = None,
     asin: str | None = None,
 
-    date: str | None = None,
+    startDate: str | None = None,
+    endDate: str | None = None,
 
     ttlSeconds: int = 3600,
     forceRefresh: bool = False,
@@ -288,22 +331,18 @@ def ads_summary(
             detail="Provide sku or asin",
         )
 
-    if not date:
-        date = datetime.date.today().isoformat()
+    startDate, endDate = validate_date_range(startDate, endDate)
 
     params_for_key = {
-
         "adsRegion": adsRegion,
         "adsProfileId": adsProfileId,
-
         "region": region,
         "marketplaceId": marketplaceId,
-
         "sku": sku or "",
         "asin": asin or "",
-
-        "date": date,
-        "version": 1,
+        "startDate": startDate,
+        "endDate": endDate,
+        "version": 3,
     }
 
     cache_key = build_cache_key(
@@ -327,29 +366,24 @@ def ads_summary(
         ads_perf = ads_client.fetch_campaign_performance(
             region=adsRegion,
             profile_id=adsProfileId,
-            date=date,
             sku=sku_for_ads,
+            start_date=startDate,
+            end_date=endDate,
         )
 
         return {
-
             "identity": {
-
                 "sku": sku or "",
                 "asin": asin or "",
-
-                "date": date,
-
+                "startDate": startDate,
+                "endDate": endDate,
                 "marketplaceId": marketplaceId,
                 "region": region,
-
                 "adsRegion": adsRegion,
                 "adsProfileId": adsProfileId,
             },
-
             "sp_api": spapi,
             "ads": ads_perf,
-
             "computed": compute_summary_metrics(
                 spapi,
                 ads_perf,

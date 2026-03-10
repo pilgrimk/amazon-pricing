@@ -202,8 +202,11 @@ class AdsCache:
         return fresh, data
 
 
+from app.config import settings
+
 def cache_from_env() -> AdsCache:
-    db_path = os.getenv("ADS_CACHE_DB_PATH", "/opt/amazon_ads/cache/ads_cache.sqlite3")
-    ttl = int(os.getenv("ADS_CACHE_TTL_SECONDS", "86400"))
-    debug = os.getenv("ADS_CACHE_DEBUG", "false").strip().lower() in ("1", "true", "yes", "y")
-    return AdsCache(db_path=db_path, default_ttl_seconds=ttl, debug=debug)
+    return AdsCache(
+        db_path=settings.ads_cache_db_path or "./local_cache/ads_cache.db",
+        default_ttl_seconds=settings.ads_cache_ttl_seconds,
+        debug=settings.ads_cache_debug,
+    )

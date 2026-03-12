@@ -1,9 +1,12 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
     # Gateway auth
     gateway_api_key: str = Field(alias="GATEWAY_API_KEY")
@@ -17,9 +20,18 @@ class Settings(BaseSettings):
     lwa_refresh_token_fe: str | None = Field(default=None, alias="LWA_REFRESH_TOKEN_FE")
 
     # SP-API hosts
-    spapi_host_na: str = Field(default="sellingpartnerapi-na.amazon.com", alias="SPAPI_HOST_NA")
-    spapi_host_eu: str = Field(default="sellingpartnerapi-eu.amazon.com", alias="SPAPI_HOST_EU")
-    spapi_host_fe: str = Field(default="sellingpartnerapi-fe.amazon.com", alias="SPAPI_HOST_FE")
+    spapi_host_na: str = Field(
+        default="sellingpartnerapi-na.amazon.com",
+        alias="SPAPI_HOST_NA",
+    )
+    spapi_host_eu: str = Field(
+        default="sellingpartnerapi-eu.amazon.com",
+        alias="SPAPI_HOST_EU",
+    )
+    spapi_host_fe: str = Field(
+        default="sellingpartnerapi-fe.amazon.com",
+        alias="SPAPI_HOST_FE",
+    )
 
     # Ads API configuration
     application_id: str | None = Field(default=None, alias="APPLICATION_ID")
@@ -27,19 +39,52 @@ class Settings(BaseSettings):
 
     dry_run: bool = Field(default=False, alias="DRY_RUN")
 
-    # app/config.py (inside your Settings class)
-    from pydantic import Field
-
     ads_region: str = Field(default="NA", alias="ADS_REGION")
     ads_profile_id: str = Field(default="change_me", alias="ADS_PROFILE_ID")
     ads_client_id: str = Field(default="change_me", alias="ADS_CLIENT_ID")
-    ads_refresh_token_path: str = Field(default="./secrets/refresh_token.txt", alias="ADS_REFRESH_TOKEN_PATH")
+    ads_refresh_token_path: str = Field(
+        default="./secrets/refresh_token.txt",
+        alias="ADS_REFRESH_TOKEN_PATH",
+    )
 
-    ads_cache_db_path: str = Field(default="./local_cache/ads_cache.sqlite3", alias="ADS_CACHE_DB_PATH")
-    ads_cache_ttl_seconds: int = Field(default=86400, alias="ADS_CACHE_TTL_SECONDS")
+    ads_cache_db_path: str = Field(
+        default="./local_cache/ads_cache.sqlite3",
+        alias="ADS_CACHE_DB_PATH",
+    )
+    ads_cache_ttl_seconds: int = Field(
+        default=86400,
+        alias="ADS_CACHE_TTL_SECONDS",
+    )
     ads_cache_debug: bool = Field(default=False, alias="ADS_CACHE_DEBUG")
 
-    sp_api_base_url: str = Field(default="http://127.0.0.1:8000/v1/pricing", alias="SP_API_BASE_URL")
+    ads_daily_metrics_db_path: str = Field(
+        default="./local_cache/ads_daily_metrics.db",
+        alias="ADS_DAILY_METRICS_DB_PATH",
+    )
+    ads_daily_metrics_debug: bool = Field(
+        default=False,
+        alias="ADS_DAILY_METRICS_DEBUG",
+    )
+
+    sp_api_base_url: str = Field(
+        default="http://127.0.0.1:8000/v1/pricing",
+        alias="SP_API_BASE_URL",
+    )
+
+    ads_report_max_wait_seconds: int = Field(
+        default=300,
+        alias="ADS_REPORT_MAX_WAIT_SECONDS",
+    )
+
+    ads_refresh_bootstrap_days: int = Field(
+        default=7,
+        alias="ADS_REFRESH_BOOTSTRAP_DAYS",
+    )
+
+    ads_refresh_lag_days: int = Field(
+        default=1,
+        alias="ADS_REFRESH_LAG_DAYS",
+    )
 
 
 settings = Settings()
@@ -59,6 +104,7 @@ def host_for_region(region: str) -> str:
 def refresh_token_for_region(region: str) -> str:
     r = region.lower().strip()
     token = None
+
     if r == "na":
         token = settings.lwa_refresh_token_na
     elif r == "eu":
@@ -67,5 +113,9 @@ def refresh_token_for_region(region: str) -> str:
         token = settings.lwa_refresh_token_fe
 
     if not token:
-        raise ValueError(f"Missing refresh token for region '{region}'. Set LWA_REFRESH_TOKEN_{r.upper()}.")
+        raise ValueError(
+            f"Missing refresh token for region '{region}'. "
+            f"Set LWA_REFRESH_TOKEN_{r.upper()}."
+        )
+
     return token

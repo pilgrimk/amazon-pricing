@@ -1,33 +1,23 @@
 from __future__ import annotations
 
-import os
 import datetime
 import requests
 from fastapi import APIRouter, HTTPException, Request
 
+from app.config import settings
 from app.ads_cache import cache_from_env, build_cache_key
+from app.ads_metrics import metrics_store_from_env
 from app import ads_client
 
 
-# Router (merged into main FastAPI app)
 router = APIRouter(prefix="/v1/ads", tags=["ads"])
-
-
-# Environment
-GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "change_me")
-SP_API_BASE_URL = os.getenv(
-    "SP_API_BASE_URL",
-    "http://127.0.0.1:8000/v1/pricing"
-)
 
 MAX_HISTORY_DAYS = 95
 
 cache = cache_from_env()
+metrics_store = metrics_store_from_env()
 
 
-# ---------------------------------------------------------------------------
-# Cache metadata helper (returns cache status without embedding cached payload)
-# ---------------------------------------------------------------------------
 def cache_meta_public(meta):
     return {
         "hit": meta.hit,
@@ -38,18 +28,12 @@ def cache_meta_public(meta):
     }
 
 
-# ---------------------------------------------------------------------------
-# Auth helper (same pattern as your existing gateway)
-# ---------------------------------------------------------------------------
 def verify_key(request: Request):
     key = request.headers.get("x-api-key")
-    if key != GATEWAY_API_KEY:
+    if key != settings.gateway_api_key:
         raise HTTPException(status_code=401, detail="invalid api key")
 
 
-# ---------------------------------------------------------------------------
-# Date range validation
-# ---------------------------------------------------------------------------
 def validate_date_range(start_date: str | None, end_date: str | None) -> tuple[str, str]:
     if not start_date or not end_date:
         raise HTTPException(
@@ -82,16 +66,12 @@ def validate_date_range(start_date: str | None, end_date: str | None) -> tuple[s
     return start.isoformat(), end.isoformat()
 
 
-# ---------------------------------------------------------------------------
-# Call existing SP-API pricing endpoint (internal call)
-# ---------------------------------------------------------------------------
 def fetch_spapi_pricing(
     region: str,
     marketplace_id: str,
     sku: str | None,
     asin: str | None,
 ) -> dict:
-
     params = {
         "region": region,
         "marketplaceId": marketplace_id,
@@ -104,9 +84,9 @@ def fetch_spapi_pricing(
         params["asin"] = asin
 
     resp = requests.get(
-        SP_API_BASE_URL,
+        settings.sp_api_base_url,
         params=params,
-        headers={"x-api-key": GATEWAY_API_KEY},
+        headers={"x-api-key": settings.gateway_api_key},
         timeout=30,
     )
 
@@ -119,13 +99,9 @@ def fetch_spapi_pricing(
     return resp.json()
 
 
-# ---------------------------------------------------------------------------
-# Compute combined metrics (safe / conservative)
-# ---------------------------------------------------------------------------
 def compute_summary_metrics(spapi: dict, ads: dict) -> dict:
     """
     Extract unified metrics from SP-API pricing + Ads performance.
-
     Supports:
     - normalized schema (selected_price, sales_price)
     - raw SP-API dry_run schema (raw.payload.pricing.landedPrice)
@@ -138,21 +114,15 @@ def compute_summary_metrics(spapi: dict, ads: dict) -> dict:
     currency = None
 
     if isinstance(spapi, dict):
-
-        # Preferred normalized schema
         if spapi.get("selected_price") is not None:
             price = spapi.get("selected_price")
-            currency = (
-                spapi.get("selected_currency")
-                or spapi.get("currency")
-            )
+            currency = spapi.get("selected_currency") or spapi.get("currency")
 
         elif spapi.get("sales_price") is not None:
             price = spapi.get("sales_price")
             currency = spapi.get("currency")
 
         else:
-            # Dry-run / simplified raw payload schema
             try:
                 pricing = spapi["raw"]["payload"]["pricing"]
                 price = pricing.get("landedPrice") or pricing.get("listingPrice")
@@ -160,7 +130,6 @@ def compute_summary_metrics(spapi: dict, ads: dict) -> dict:
             except Exception:
                 pass
 
-            # Real SP-API payload schema
             if price is None:
                 try:
                     payload = spapi["raw"]["payload"]
@@ -212,16 +181,12 @@ def compute_summary_metrics(spapi: dict, ads: dict) -> dict:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Campaign list
-# ---------------------------------------------------------------------------
 @router.get("/campaigns")
 def get_campaigns(
     request: Request,
     region: str,
     profileId: str,
 ):
-
     verify_key(request)
 
     cache_key = build_cache_key(
@@ -249,9 +214,6 @@ def get_campaigns(
     }
 
 
-# ---------------------------------------------------------------------------
-# Report endpoint (historical range)
-# ---------------------------------------------------------------------------
 @router.get("/report")
 def get_report(
     request: Request,
@@ -262,7 +224,6 @@ def get_report(
     endDate: str,
     ttlSeconds: int = 86400,
 ):
-
     verify_key(request)
     startDate, endDate = validate_date_range(startDate, endDate)
 
@@ -300,29 +261,21 @@ def get_report(
     }
 
 
-# ---------------------------------------------------------------------------
-# Summary endpoint (pricing + ads)
-# ---------------------------------------------------------------------------
-@router.get("/summary")
-def ads_summary(
+@router.post("/refresh")
+def refresh_ads_daily_metrics(
     request: Request,
-
     adsRegion: str = "NA",
     adsProfileId: str = "change_me",
-
-    region: str = "na",
-    marketplaceId: str = "ATVPDKIKX0DER",
-
     sku: str | None = None,
     asin: str | None = None,
-
     startDate: str | None = None,
     endDate: str | None = None,
-
-    ttlSeconds: int = 3600,
-    forceRefresh: bool = False,
 ):
-
+    """
+    Refreshes daily Ads metrics from Amazon Ads and writes them to the local
+    analytics store. This endpoint is the ingestion path for nightly jobs or
+    manual backfills.
+    """
     verify_key(request)
 
     if not sku and not asin:
@@ -333,94 +286,194 @@ def ads_summary(
 
     startDate, endDate = validate_date_range(startDate, endDate)
 
-    params_for_key = {
-        "adsRegion": adsRegion,
-        "adsProfileId": adsProfileId,
-        "region": region,
-        "marketplaceId": marketplaceId,
-        "sku": sku or "",
-        "asin": asin or "",
-        "startDate": startDate,
-        "endDate": endDate,
-        "version": 3,
+    try:
+        result = ads_client.refresh_daily_metrics(
+            region=adsRegion,
+            profile_id=adsProfileId,
+            sku=sku or "",
+            asin=asin or "",
+            start_date=startDate,
+            end_date=endDate,
+            metrics_store=metrics_store,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ads refresh failed: {exc}",
+        ) from exc
+
+    return {
+        "endpoint": "ads_refresh",
+        "payload": {
+            "identity": {
+                "sku": sku or "",
+                "asin": asin or "",
+                "startDate": startDate,
+                "endDate": endDate,
+                "adsRegion": adsRegion,
+                "adsProfileId": adsProfileId,
+            },
+            "refresh": result,
+        },
     }
 
-    cache_key = build_cache_key(
-        ads_region=adsRegion,
-        profile_id=adsProfileId,
-        endpoint="ads_summary",
-        params=params_for_key,
-    )
 
-    def fetch_summary():
+@router.post("/refresh-roll")
+def refresh_ads_daily_metrics_roll(
+    request: Request,
+    adsRegion: str = "NA",
+    adsProfileId: str = "change_me",
+    sku: str | None = None,
+    asin: str | None = None,
+    bootstrapDays: int | None = None,
+):
+    """
+    Rolling refresh endpoint.
+    Refreshes only missing days through yesterday.
+    If no data exists yet, bootstraps a trailing window.
+    """
+    verify_key(request)
 
+    if not sku and not asin:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide sku or asin",
+        )
+
+    try:
+        result = ads_client.refresh_daily_metrics_roll(
+            region=adsRegion,
+            profile_id=adsProfileId,
+            sku=sku or "",
+            asin=asin or "",
+            metrics_store=metrics_store,
+            bootstrap_days=bootstrapDays,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ads rolling refresh failed: {exc}",
+        ) from exc
+
+    return {
+        "endpoint": "ads_refresh_roll",
+        "payload": {
+            "identity": {
+                "sku": sku or "",
+                "asin": asin or "",
+                "adsRegion": adsRegion,
+                "adsProfileId": adsProfileId,
+                "bootstrapDays": bootstrapDays,
+            },
+            "refresh": result,
+        },
+    }
+
+
+@router.get("/summary")
+def ads_summary(
+    request: Request,
+    adsRegion: str = "NA",
+    adsProfileId: str = "change_me",
+    region: str = "na",
+    marketplaceId: str = "ATVPDKIKX0DER",
+    sku: str | None = None,
+    asin: str | None = None,
+    startDate: str | None = None,
+    endDate: str | None = None,
+):
+    """
+    Read-only analytics endpoint.
+    Pricing is pulled live from the SP-API pricing endpoint.
+    Ads performance is aggregated from the local daily metrics store.
+    """
+    verify_key(request)
+
+    if not sku and not asin:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide sku or asin",
+        )
+
+    startDate, endDate = validate_date_range(startDate, endDate)
+
+    try:
         spapi = fetch_spapi_pricing(
             region=region,
             marketplace_id=marketplaceId,
             sku=sku,
             asin=asin,
         )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"sp_api pricing fetch failed: {exc}",
+        ) from exc
 
-        sku_for_ads = sku or ""
-
-        ads_perf = ads_client.fetch_campaign_performance(
-            region=adsRegion,
-            profile_id=adsProfileId,
-            sku=sku_for_ads,
-            start_date=startDate,
-            end_date=endDate,
-        )
-
-        return {
-            "identity": {
-                "sku": sku or "",
-                "asin": asin or "",
-                "startDate": startDate,
-                "endDate": endDate,
-                "marketplaceId": marketplaceId,
-                "region": region,
-                "adsRegion": adsRegion,
-                "adsProfileId": adsProfileId,
-            },
-            "sp_api": spapi,
-            "ads": ads_perf,
-            "computed": compute_summary_metrics(
-                spapi,
-                ads_perf,
-            ),
-        }
-
-    if forceRefresh:
-
-        payload = fetch_summary()
-
-        cache.set(
-            cache_key,
-            payload,
-            ttl_seconds=ttlSeconds,
-        )
-
-        meta = cache.get(
-            cache_key,
-            allow_stale=True,
-        )
-
-        return {
-            "endpoint": "ads_summary",
-            "cache": cache_meta_public(meta),
-            "payload": payload,
-        }
-
-    meta, payload = cache.get_or_fetch(
-        cache_key=cache_key,
-        ttl_seconds=ttlSeconds,
-        fetch_fn=fetch_summary,
-        allow_stale=False,
-        refresh_if_stale=True,
+    coverage = metrics_store.get_coverage(
+        ads_region=adsRegion,
+        profile_id=adsProfileId,
+        start_date=startDate,
+        end_date=endDate,
+        sku=sku,
+        asin=asin,
     )
+
+    ads_summary_data = metrics_store.get_summary(
+        ads_region=adsRegion,
+        profile_id=adsProfileId,
+        start_date=startDate,
+        end_date=endDate,
+        sku=sku,
+        asin=asin,
+    )
+
+    payload = {
+        "identity": {
+            "sku": sku or "",
+            "asin": asin or "",
+            "startDate": startDate,
+            "endDate": endDate,
+            "marketplaceId": marketplaceId,
+            "region": region,
+            "adsRegion": adsRegion,
+            "adsProfileId": adsProfileId,
+        },
+        "sp_api": spapi,
+        "ads": {
+            "region": adsRegion,
+            "profile_id": adsProfileId,
+            "start_date": startDate,
+            "end_date": endDate,
+            "sku": sku or "",
+            "asin": asin or "",
+            "impressions": ads_summary_data.get("impressions", 0),
+            "clicks": ads_summary_data.get("clicks", 0),
+            "spend": ads_summary_data.get("spend", 0.0),
+            "sales": ads_summary_data.get("sales", 0.0),
+            "orders": ads_summary_data.get("orders", 0),
+            "units": ads_summary_data.get("units", 0),
+            "acos": ads_summary_data.get("acos"),
+            "row_count": ads_summary_data.get("row_count", 0),
+            "source": "daily_metrics",
+        },
+        "coverage": {
+            "expected_days": coverage.expected_days,
+            "found_days": coverage.found_days,
+            "complete": coverage.complete,
+            "min_date": coverage.min_date,
+            "max_date": coverage.max_date,
+            "last_updated_at": coverage.last_updated_at,
+        },
+        "computed": compute_summary_metrics(
+            spapi,
+            ads_summary_data,
+        ),
+    }
 
     return {
         "endpoint": "ads_summary",
-        "cache": cache_meta_public(meta),
         "payload": payload,
     }

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import gzip
 import json
 import threading
@@ -18,6 +18,7 @@ _REPORTS_URL = "https://advertising-api.amazon.com/reporting/reports"
 
 MAX_HISTORY_DAYS = 95
 MAX_DAYS_PER_CHUNK = 31
+DEFAULT_REPORT_MAX_WAIT_SECONDS = settings.ads_report_max_wait_seconds
 
 # Simple in-process token cache
 _token_lock = threading.Lock()
@@ -105,7 +106,33 @@ def _parse_iso_date(value: str):
     return datetime.strptime(value, "%Y-%m-%d").date()
 
 
-def _validate_history_window(start_date: str, end_date: str, max_days: int = MAX_HISTORY_DAYS) -> tuple[str, str]:
+def _compute_roll_window(
+    *,
+    latest_stored_date: str | None,
+    bootstrap_days: int,
+    lag_days: int,
+) -> tuple[str, str] | None:
+    today = datetime.utcnow().date()
+    target_end = today - timedelta(days=lag_days)
+
+    if latest_stored_date:
+        latest = _parse_iso_date(latest_stored_date)
+        next_start = latest + timedelta(days=1)
+
+        if next_start > target_end:
+            return None
+
+        return next_start.isoformat(), target_end.isoformat()
+
+    bootstrap_start = target_end - timedelta(days=max(bootstrap_days - 1, 0))
+    return bootstrap_start.isoformat(), target_end.isoformat()
+
+
+def _validate_history_window(
+    start_date: str,
+    end_date: str,
+    max_days: int = MAX_HISTORY_DAYS,
+) -> tuple[str, str]:
     start = _parse_iso_date(start_date)
     end = _parse_iso_date(end_date)
 
@@ -124,6 +151,7 @@ def _request_report(
     start_date: str,
     end_date: str,
     *,
+    time_unit: str = "SUMMARY",
     force_token_refresh: bool = False,
 ) -> str:
     """
@@ -135,25 +163,30 @@ def _request_report(
         force_token_refresh=force_token_refresh,
     )
 
+    columns = [
+        "advertisedSku",
+        "advertisedAsin",
+        "impressions",
+        "clicks",
+        "cost",
+        "purchases14d",
+        "sales14d",
+        "unitsSoldClicks14d",
+    ]
+
+    if time_unit.upper() == "DAILY":
+        columns = ["date"] + columns
+
     body = {
-        "name": f"spAdvertisedProduct_{start_date}_{end_date}",
+        "name": f"spAdvertisedProduct_{time_unit.lower()}_{start_date}_{end_date}",
         "startDate": start_date,
         "endDate": end_date,
         "configuration": {
             "adProduct": "SPONSORED_PRODUCTS",
             "groupBy": ["advertiser"],
-            "columns": [
-                "advertisedSku",
-                "advertisedAsin",
-                "impressions",
-                "clicks",
-                "cost",
-                "purchases14d",
-                "sales14d",
-                "unitsSoldClicks14d",
-            ],
+            "columns": columns,
             "reportTypeId": "spAdvertisedProduct",
-            "timeUnit": "SUMMARY",
+            "timeUnit": time_unit.upper(),
             "format": "GZIP_JSON",
         },
     }
@@ -176,7 +209,7 @@ def _poll_report(
     profile_id: str,
     report_id: str,
     *,
-    max_wait_seconds: int = 300,
+    max_wait_seconds: int = DEFAULT_REPORT_MAX_WAIT_SECONDS,
     poll_interval_seconds: int = 5,
 ) -> Dict[str, Any]:
     """
@@ -303,6 +336,7 @@ def _aggregate_rows_for_sku(rows: List[Dict[str, Any]], sku: str) -> Dict[str, A
     clicks = 0
     impressions = 0
     orders = 0
+    units = 0
 
     for row in rows:
         row_sku = str(row.get("advertisedSku") or "").strip().lower()
@@ -320,6 +354,7 @@ def _aggregate_rows_for_sku(rows: List[Dict[str, Any]], sku: str) -> Dict[str, A
         clicks += _to_int(row.get("clicks"))
         impressions += _to_int(row.get("impressions"))
         orders += _to_int(row.get("purchases14d"))
+        units += _to_int(row.get("unitsSoldClicks14d"))
 
     acos = None
     if sales > 0:
@@ -335,6 +370,7 @@ def _aggregate_rows_for_sku(rows: List[Dict[str, Any]], sku: str) -> Dict[str, A
         "clicks": clicks,
         "impressions": impressions,
         "orders": orders,
+        "units": units,
         "acos": acos,
     }
 
@@ -350,6 +386,7 @@ def _aggregate_chunk_results(chunk_results: List[Dict[str, Any]]) -> Dict[str, A
     total_clicks = 0
     total_impressions = 0
     total_orders = 0
+    total_units = 0
 
     report_ids: List[str] = []
 
@@ -365,6 +402,7 @@ def _aggregate_chunk_results(chunk_results: List[Dict[str, Any]]) -> Dict[str, A
         total_clicks += _to_int(result.get("clicks"))
         total_impressions += _to_int(result.get("impressions"))
         total_orders += _to_int(result.get("orders"))
+        total_units += _to_int(result.get("units"))
 
         for asin in result.get("matched_asins", []):
             if asin:
@@ -393,8 +431,91 @@ def _aggregate_chunk_results(chunk_results: List[Dict[str, Any]]) -> Dict[str, A
         "clicks": total_clicks,
         "impressions": total_impressions,
         "orders": total_orders,
+        "units": total_units,
         "acos": acos,
     }
+
+
+def _normalize_daily_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    ads_region: str,
+    profile_id: str,
+    sku: str,
+    asin: str,
+) -> List[Dict[str, Any]]:
+    """
+    Convert DAILY report rows into one normalized row per date for the target SKU/ASIN.
+    If multiple report rows exist for the same date, aggregate them.
+    """
+    sku_norm = (sku or "").strip().lower()
+    asin_norm = (asin or "").strip().lower()
+
+    by_date: dict[str, Dict[str, Any]] = {}
+
+    for row in rows:
+        row_date = str(row.get("date") or "").strip()
+        if not row_date:
+            continue
+
+        row_sku = str(row.get("advertisedSku") or "").strip()
+        row_asin = str(row.get("advertisedAsin") or "").strip()
+
+        row_sku_norm = row_sku.lower()
+        row_asin_norm = row_asin.lower()
+
+        sku_match = bool(sku_norm) and row_sku_norm == sku_norm
+        asin_match = bool(asin_norm) and row_asin_norm == asin_norm
+
+        if sku_norm and asin_norm:
+            if not (sku_match or asin_match):
+                continue
+        elif sku_norm:
+            if not sku_match:
+                continue
+        elif asin_norm:
+            if not asin_match:
+                continue
+        else:
+            continue
+
+        bucket = by_date.setdefault(
+            row_date,
+            {
+                "date": row_date,
+                "ads_region": ads_region,
+                "profile_id": profile_id,
+                "sku": row_sku or sku,
+                "asin": row_asin or asin,
+                "impressions": 0,
+                "clicks": 0,
+                "spend": 0.0,
+                "sales": 0.0,
+                "orders": 0,
+                "units": 0,
+            },
+        )
+
+        if not bucket.get("sku") and row_sku:
+            bucket["sku"] = row_sku
+        if not bucket.get("asin") and row_asin:
+            bucket["asin"] = row_asin
+
+        bucket["impressions"] += _to_int(row.get("impressions"))
+        bucket["clicks"] += _to_int(row.get("clicks"))
+        bucket["spend"] += _to_float(row.get("cost"))
+        bucket["sales"] += _to_float(row.get("sales14d"))
+        bucket["orders"] += _to_int(row.get("purchases14d"))
+        bucket["units"] += _to_int(row.get("unitsSoldClicks14d"))
+
+    normalized_rows: List[Dict[str, Any]] = []
+    for date_key in sorted(by_date.keys()):
+        bucket = by_date[date_key]
+        bucket["spend"] = round(bucket["spend"], 2)
+        bucket["sales"] = round(bucket["sales"], 2)
+        normalized_rows.append(bucket)
+
+    return normalized_rows
 
 
 def _fetch_campaign_performance_for_range(
@@ -404,9 +525,14 @@ def _fetch_campaign_performance_for_range(
     end_date: str,
     sku: str,
     *,
-    max_wait_seconds: int = 300,
+    max_wait_seconds: int = DEFAULT_REPORT_MAX_WAIT_SECONDS,
 ) -> Dict[str, Any]:
-    report_id = _request_report(profile_id=profile_id, start_date=start_date, end_date=end_date)
+    report_id = _request_report(
+        profile_id=profile_id,
+        start_date=start_date,
+        end_date=end_date,
+        time_unit="SUMMARY",
+    )
     status_data = _poll_report(
         profile_id=profile_id,
         report_id=report_id,
@@ -439,7 +565,41 @@ def _fetch_campaign_performance_for_range(
         "clicks": agg["clicks"],
         "impressions": agg["impressions"],
         "orders": agg["orders"],
+        "units": agg["units"],
         "acos": agg["acos"],
+    }
+
+
+def _fetch_daily_report_rows_for_range(
+    profile_id: str,
+    start_date: str,
+    end_date: str,
+    *,
+    max_wait_seconds: int = DEFAULT_REPORT_MAX_WAIT_SECONDS,
+) -> Dict[str, Any]:
+    report_id = _request_report(
+        profile_id=profile_id,
+        start_date=start_date,
+        end_date=end_date,
+        time_unit="DAILY",
+    )
+    status_data = _poll_report(
+        profile_id=profile_id,
+        report_id=report_id,
+        max_wait_seconds=max_wait_seconds,
+    )
+
+    download_url = status_data.get("url") or status_data.get("location")
+    if not download_url:
+        raise RuntimeError(f"Report completed but no download URL returned: {status_data}")
+
+    rows = _download_report(download_url)
+
+    return {
+        "report_id": report_id,
+        "report_status": status_data.get("status"),
+        "row_count": len(rows),
+        "rows": rows,
     }
 
 
@@ -479,7 +639,12 @@ def fetch_report(
     total_rows = 0
 
     for chunk_start, chunk_end in chunks:
-        report_id = _request_report(profile_id=profile_id, start_date=chunk_start, end_date=chunk_end)
+        report_id = _request_report(
+            profile_id=profile_id,
+            start_date=chunk_start,
+            end_date=chunk_end,
+            time_unit="SUMMARY",
+        )
         status_data = _poll_report(profile_id=profile_id, report_id=report_id)
 
         download_url = status_data.get("url") or status_data.get("location")
@@ -518,7 +683,7 @@ def fetch_campaign_performance(
 ) -> Dict[str, Any]:
     """
     Historical range only.
-    Uses Sponsored Products v3 Advertised Product report.
+    Uses Sponsored Products v3 Advertised Product SUMMARY report.
     """
     start_date, end_date = _validate_history_window(start_date, end_date)
 
@@ -533,7 +698,7 @@ def fetch_campaign_performance(
                 start_date=chunk_start,
                 end_date=chunk_end,
                 sku=sku,
-                max_wait_seconds=300,
+                max_wait_seconds=DEFAULT_REPORT_MAX_WAIT_SECONDS,
             )
         )
 
@@ -560,5 +725,198 @@ def fetch_campaign_performance(
         "clicks": agg["clicks"],
         "impressions": agg["impressions"],
         "orders": agg["orders"],
+        "units": agg["units"],
         "acos": agg["acos"],
     }
+
+
+def refresh_daily_metrics(
+    region: str,
+    profile_id: str,
+    sku: str,
+    asin: str,
+    start_date: str,
+    end_date: str,
+    metrics_store,
+) -> Dict[str, Any]:
+    """
+    Fetch DAILY Amazon Ads report data, normalize it to one row per day for the
+    requested SKU/ASIN, and upsert it into the local ads_daily_metrics store.
+    """
+    start_date, end_date = _validate_history_window(start_date, end_date)
+
+    chunks = _daterange_chunks(start_date, end_date, max_days_per_chunk=MAX_DAYS_PER_CHUNK)
+
+    report_ids: List[str] = []
+    total_source_rows = 0
+    all_daily_rows: List[Dict[str, Any]] = []
+
+    for chunk_start, chunk_end in chunks:
+        result = _fetch_daily_report_rows_for_range(
+            profile_id=profile_id,
+            start_date=chunk_start,
+            end_date=chunk_end,
+            max_wait_seconds=DEFAULT_REPORT_MAX_WAIT_SECONDS,
+        )
+
+        report_ids.append(result["report_id"])
+        total_source_rows += _to_int(result.get("row_count"))
+
+        normalized_rows = _normalize_daily_rows(
+            result.get("rows", []),
+            ads_region=region,
+            profile_id=profile_id,
+            sku=sku,
+            asin=asin,
+        )
+
+        all_daily_rows.extend(normalized_rows)
+
+    # Re-aggregate across all chunks by date just in case
+    final_rows = _normalize_daily_rows(
+        [
+            {
+                "date": row["date"],
+                "advertisedSku": row.get("sku", ""),
+                "advertisedAsin": row.get("asin", ""),
+                "impressions": row.get("impressions", 0),
+                "clicks": row.get("clicks", 0),
+                "cost": row.get("spend", 0.0),
+                "purchases14d": row.get("orders", 0),
+                "sales14d": row.get("sales", 0.0),
+                "unitsSoldClicks14d": row.get("units", 0),
+            }
+            for row in all_daily_rows
+        ],
+        ads_region=region,
+        profile_id=profile_id,
+        sku=sku,
+        asin=asin,
+    )
+
+    rows_upserted = metrics_store.upsert_rows(final_rows)
+
+    summary = metrics_store.get_summary(
+        ads_region=region,
+        profile_id=profile_id,
+        start_date=start_date,
+        end_date=end_date,
+        sku=sku or None,
+        asin=asin or None,
+    )
+
+    coverage = metrics_store.get_coverage(
+        ads_region=region,
+        profile_id=profile_id,
+        start_date=start_date,
+        end_date=end_date,
+        sku=sku or None,
+        asin=asin or None,
+    )
+
+    return {
+        "stub": False,
+        "region": region,
+        "profile_id": profile_id,
+        "sku": sku,
+        "asin": asin,
+        "start_date": start_date,
+        "end_date": end_date,
+        "chunk_count": len(chunks),
+        "chunks": [{"start_date": s, "end_date": e} for s, e in chunks],
+        "report_ids": report_ids,
+        "source_row_count": total_source_rows,
+        "rows_upserted": rows_upserted,
+        "daily_row_count": len(final_rows),
+        "coverage": {
+            "expected_days": coverage.expected_days,
+            "found_days": coverage.found_days,
+            "complete": coverage.complete,
+            "min_date": coverage.min_date,
+            "max_date": coverage.max_date,
+            "last_updated_at": coverage.last_updated_at,
+        },
+        "summary": {
+            "impressions": summary.get("impressions", 0),
+            "clicks": summary.get("clicks", 0),
+            "spend": summary.get("spend", 0.0),
+            "sales": summary.get("sales", 0.0),
+            "orders": summary.get("orders", 0),
+            "units": summary.get("units", 0),
+            "acos": summary.get("acos"),
+            "row_count": summary.get("row_count", 0),
+        },
+    }
+
+
+def refresh_daily_metrics_roll(
+    region: str,
+    profile_id: str,
+    sku: str,
+    asin: str,
+    metrics_store,
+    bootstrap_days: int | None = None,
+    lag_days: int | None = None,
+) -> Dict[str, Any]:
+    """
+    Rolling daily refresh.
+    - If data already exists, fetch only missing days through yesterday.
+    - If no data exists, bootstrap a configurable trailing window.
+    """
+    bootstrap_days = bootstrap_days or settings.ads_refresh_bootstrap_days
+    lag_days = lag_days if lag_days is not None else settings.ads_refresh_lag_days
+
+    latest_stored_date = metrics_store.get_latest_stored_date(
+        ads_region=region,
+        profile_id=profile_id,
+        sku=sku or None,
+        asin=asin or None,
+    )
+
+    window = _compute_roll_window(
+        latest_stored_date=latest_stored_date,
+        bootstrap_days=bootstrap_days,
+        lag_days=lag_days,
+    )
+
+    if window is None:
+        today = datetime.utcnow().date()
+        target_end = today - timedelta(days=lag_days)
+
+        return {
+            "stub": False,
+            "region": region,
+            "profile_id": profile_id,
+            "sku": sku,
+            "asin": asin,
+            "already_current": True,
+            "latest_stored_date": latest_stored_date,
+            "target_end_date": target_end.isoformat(),
+            "rows_upserted": 0,
+            "daily_row_count": 0,
+            "coverage": None,
+            "summary": None,
+        }
+
+    start_date, end_date = window
+
+    refresh_result = refresh_daily_metrics(
+        region=region,
+        profile_id=profile_id,
+        sku=sku,
+        asin=asin,
+        start_date=start_date,
+        end_date=end_date,
+        metrics_store=metrics_store,
+    )
+
+    refresh_result["already_current"] = False
+    refresh_result["latest_stored_date_before_refresh"] = latest_stored_date
+    refresh_result["roll_window"] = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "bootstrap_days": bootstrap_days,
+        "lag_days": lag_days,
+    }
+
+    return refresh_result

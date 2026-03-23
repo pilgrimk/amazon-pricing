@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from http.client import RemoteDisconnected
 from typing import Any, Dict, List
-from datetime import datetime, timedelta, date
 import gzip
 import json
 import threading
 import time
+import uuid
 
 import requests
+from requests.exceptions import ConnectionError as RequestsConnectionError, ReadTimeout, Timeout
 
 from app.config import settings
 
@@ -20,12 +24,28 @@ MAX_HISTORY_DAYS = 95
 MAX_DAYS_PER_CHUNK = 31
 DEFAULT_REPORT_MAX_WAIT_SECONDS = settings.ads_report_max_wait_seconds
 
+HTTP_MAX_RETRIES = 3
+HTTP_RETRY_DELAY_SECONDS = 2
+BATCH_MAX_WORKERS = 2
+
 # Simple in-process token cache
 _token_lock = threading.Lock()
 _token_cache: dict[str, Any] = {
     "access_token": None,
     "expires_at": 0,
 }
+
+# Simple in-memory batch job registry (non-persistent by design)
+_batch_jobs_lock = threading.Lock()
+_batch_jobs: dict[str, dict[str, Any]] = {}
+
+
+# --------------------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------------------
+
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
 def _read_ads_refresh_token() -> str:
@@ -39,67 +59,6 @@ def _read_ads_refresh_token() -> str:
         raise RuntimeError("ADS refresh token file is empty")
 
     return token
-
-
-def get_ads_access_token(force_refresh: bool = False) -> str:
-    """
-    Return a cached Amazon Ads access token if still valid.
-    Refresh only when missing, expired, or force_refresh=True.
-    """
-    now = int(time.time())
-    refresh_buffer_seconds = 120
-
-    with _token_lock:
-        cached_token = _token_cache.get("access_token")
-        expires_at = int(_token_cache.get("expires_at") or 0)
-
-        if (
-            not force_refresh
-            and cached_token
-            and now < (expires_at - refresh_buffer_seconds)
-        ):
-            return cached_token
-
-        refresh_token = _read_ads_refresh_token()
-
-        if not settings.ads_client_id:
-            raise RuntimeError("ADS_CLIENT_ID is not configured")
-        if not settings.ads_client_secret:
-            raise RuntimeError("ADS_CLIENT_SECRET is not configured")
-
-        payload = {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": settings.ads_client_id,
-            "client_secret": settings.ads_client_secret,
-        }
-
-        resp = requests.post(_TOKEN_URL, data=payload, timeout=30)
-        if not resp.ok:
-            raise RuntimeError(
-                f"Ads token request failed: status={resp.status_code}, body={resp.text}"
-            )
-
-        data = resp.json()
-        access_token = data["access_token"]
-        expires_in = int(data.get("expires_in", 3600))
-
-        _token_cache["access_token"] = access_token
-        _token_cache["expires_at"] = now + expires_in
-
-        return access_token
-
-
-def build_ads_headers(profile_id: str, force_token_refresh: bool = False) -> Dict[str, str]:
-    access_token = get_ads_access_token(force_refresh=force_token_refresh)
-
-    return {
-        "Authorization": f"Bearer {access_token}",
-        "Amazon-Advertising-API-ClientId": settings.ads_client_id or "",
-        "Amazon-Advertising-API-Scope": profile_id,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
 
 
 def _parse_iso_date(value: str):
@@ -128,6 +87,22 @@ def _compute_roll_window(
     return bootstrap_start.isoformat(), target_end.isoformat()
 
 
+def _compute_nightly_slice_window(
+    *,
+    latest_stored_date: str | None,
+    bootstrap_days: int,
+    lag_days: int,
+) -> tuple[str, str]:
+    today = datetime.utcnow().date()
+    target_date = today - timedelta(days=lag_days)
+
+    if latest_stored_date:
+        return target_date.isoformat(), target_date.isoformat()
+
+    bootstrap_start = target_date - timedelta(days=max(bootstrap_days - 1, 0))
+    return bootstrap_start.isoformat(), target_date.isoformat()
+
+
 def _validate_history_window(
     start_date: str,
     end_date: str,
@@ -146,6 +121,54 @@ def _validate_history_window(
     return start.isoformat(), end.isoformat()
 
 
+def _request_with_retries(
+    method: str,
+    url: str,
+    *,
+    max_retries: int = HTTP_MAX_RETRIES,
+    retry_delay_seconds: int = HTTP_RETRY_DELAY_SECONDS,
+    retry_on_statuses: tuple[int, ...] = (500, 502, 503, 504),
+    **kwargs,
+):
+    """
+    Wrapper around requests.request with simple retry handling for transient
+    network failures and transient 5xx responses.
+    """
+    last_exc = None
+    last_response = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.request(method=method, url=url, **kwargs)
+            last_response = resp
+
+            if resp.status_code in retry_on_statuses and attempt < max_retries:
+                time.sleep(retry_delay_seconds)
+                continue
+
+            return resp
+
+        except (
+            RequestsConnectionError,
+            ReadTimeout,
+            Timeout,
+            RemoteDisconnected,
+        ) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                time.sleep(retry_delay_seconds)
+                continue
+            raise
+
+    if last_response is not None:
+        return last_response
+
+    if last_exc is not None:
+        raise last_exc
+
+    raise RuntimeError("HTTP request failed for an unknown reason")
+
+
 def _request_report(
     profile_id: str,
     start_date: str,
@@ -157,6 +180,10 @@ def _request_report(
     """
     Create a v3 Sponsored Products Advertised Product report request.
     Returns reportId.
+
+    Amazon Ads may return HTTP 425 when an equivalent report request was
+    already submitted recently. In that case, extract and reuse the existing
+    reportId so the caller can continue polling normally.
     """
     headers = build_ads_headers(
         profile_id=profile_id,
@@ -191,7 +218,36 @@ def _request_report(
         },
     }
 
-    resp = requests.post(_REPORTS_URL, headers=headers, json=body, timeout=30)
+    resp = _request_with_retries(
+        "POST",
+        _REPORTS_URL,
+        headers=headers,
+        json=body,
+        timeout=30,
+        retry_on_statuses=(500, 502, 503, 504),
+    )
+
+    if resp.status_code == 425:
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Ads report create returned duplicate status 425 but body was not valid JSON: {resp.text}"
+            ) from exc
+
+        detail = str(data.get("detail") or "").strip()
+
+        existing_report_id = None
+        if ":" in detail:
+            existing_report_id = detail.split(":")[-1].strip()
+
+        if existing_report_id:
+            return existing_report_id
+
+        raise RuntimeError(
+            f"Ads report create returned duplicate status 425 but no reusable reportId was found: {data}"
+        )
+
     if not resp.ok:
         raise RuntimeError(
             f"Ads report create failed: status={resp.status_code}, body={resp.text}"
@@ -221,7 +277,14 @@ def _poll_report(
     deadline = time.time() + max_wait_seconds
 
     while time.time() < deadline:
-        resp = requests.get(url, headers=headers, timeout=30)
+        resp = _request_with_retries(
+            "GET",
+            url,
+            headers=headers,
+            timeout=30,
+            retry_on_statuses=(500, 502, 503, 504),
+        )
+
         if not resp.ok:
             raise RuntimeError(
                 f"Ads report status failed: status={resp.status_code}, body={resp.text}"
@@ -244,7 +307,13 @@ def _download_report(download_url: str) -> List[Dict[str, Any]]:
     """
     Download GZIP_JSON report and return parsed row list.
     """
-    resp = requests.get(download_url, timeout=60)
+    resp = _request_with_retries(
+        "GET",
+        download_url,
+        timeout=60,
+        retry_on_statuses=(500, 502, 503, 504),
+    )
+
     if not resp.ok:
         raise RuntimeError(
             f"Ads report download failed: status={resp.status_code}, body={resp.text[:500]}"
@@ -603,6 +672,128 @@ def _fetch_daily_report_rows_for_range(
     }
 
 
+def _fetch_shared_daily_rows_for_window(
+    profile_id: str,
+    start_date: str,
+    end_date: str,
+    *,
+    max_wait_seconds: int = DEFAULT_REPORT_MAX_WAIT_SECONDS,
+) -> Dict[str, Any]:
+    """
+    Fetch one DAILY report for a shared date window and return raw rows.
+    This is used by batch processing so multiple ASINs/SKUs can reuse one report.
+    """
+    result = _fetch_daily_report_rows_for_range(
+        profile_id=profile_id,
+        start_date=start_date,
+        end_date=end_date,
+        max_wait_seconds=max_wait_seconds,
+    )
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "report_id": result["report_id"],
+        "report_status": result.get("report_status"),
+        "row_count": result.get("row_count", 0),
+        "rows": result.get("rows", []),
+    }
+
+
+def _normalize_batch_items(items: List[Any]) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for item in items:
+        item_type = str(getattr(item, "type", "") or "").strip().lower()
+        values = getattr(item, "values", []) or []
+
+        if item_type not in ("asin", "sku"):
+            continue
+
+        for value in values:
+            cleaned = str(value or "").strip()
+            if not cleaned:
+                continue
+
+            key = (item_type, cleaned.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if item_type == "asin":
+                normalized.append({"asin": cleaned, "sku": ""})
+            else:
+                normalized.append({"asin": "", "sku": cleaned})
+
+    return normalized
+
+
+def get_ads_access_token(force_refresh: bool = False) -> str:
+    """
+    Return a cached Amazon Ads access token if still valid.
+    Refresh only when missing, expired, or force_refresh=True.
+    """
+    now = int(time.time())
+    refresh_buffer_seconds = 120
+
+    with _token_lock:
+        cached_token = _token_cache.get("access_token")
+        expires_at = int(_token_cache.get("expires_at") or 0)
+
+        if (
+            not force_refresh
+            and cached_token
+            and now < (expires_at - refresh_buffer_seconds)
+        ):
+            return cached_token
+
+        refresh_token = _read_ads_refresh_token()
+
+        if not settings.ads_client_id:
+            raise RuntimeError("ADS_CLIENT_ID is not configured")
+        if not settings.ads_client_secret:
+            raise RuntimeError("ADS_CLIENT_SECRET is not configured")
+
+        payload = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": settings.ads_client_id,
+            "client_secret": settings.ads_client_secret,
+        }
+
+        resp = requests.post(_TOKEN_URL, data=payload, timeout=30)
+        if not resp.ok:
+            raise RuntimeError(
+                f"Ads token request failed: status={resp.status_code}, body={resp.text}"
+            )
+
+        data = resp.json()
+        access_token = data["access_token"]
+        expires_in = int(data.get("expires_in", 3600))
+
+        _token_cache["access_token"] = access_token
+        _token_cache["expires_at"] = now + expires_in
+
+        return access_token
+
+
+def build_ads_headers(profile_id: str, force_token_refresh: bool = False) -> Dict[str, str]:
+    access_token = get_ads_access_token(force_refresh=force_token_refresh)
+
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Amazon-Advertising-API-ClientId": settings.ads_client_id or "",
+        "Amazon-Advertising-API-Scope": profile_id,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+# --------------------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------------------
+
+
 def fetch_campaigns(region: str, profile_id: str) -> Dict[str, Any]:
     headers = build_ads_headers(profile_id=profile_id)
 
@@ -730,18 +921,17 @@ def fetch_campaign_performance(
     }
 
 
-def refresh_daily_metrics(
+def _prepare_daily_metrics_refresh(
     region: str,
     profile_id: str,
     sku: str,
     asin: str,
     start_date: str,
     end_date: str,
-    metrics_store,
 ) -> Dict[str, Any]:
     """
-    Fetch DAILY Amazon Ads report data, normalize it to one row per day for the
-    requested SKU/ASIN, and upsert it into the local ads_daily_metrics store.
+    Fetch DAILY Amazon Ads report data and normalize it to one row per day for
+    the requested SKU/ASIN, but do NOT write to the local metrics store.
     """
     start_date, end_date = _validate_history_window(start_date, end_date)
 
@@ -772,7 +962,6 @@ def refresh_daily_metrics(
 
         all_daily_rows.extend(normalized_rows)
 
-    # Re-aggregate across all chunks by date just in case
     final_rows = _normalize_daily_rows(
         [
             {
@@ -794,26 +983,6 @@ def refresh_daily_metrics(
         asin=asin,
     )
 
-    rows_upserted = metrics_store.upsert_rows(final_rows)
-
-    summary = metrics_store.get_summary(
-        ads_region=region,
-        profile_id=profile_id,
-        start_date=start_date,
-        end_date=end_date,
-        sku=sku or None,
-        asin=asin or None,
-    )
-
-    coverage = metrics_store.get_coverage(
-        ads_region=region,
-        profile_id=profile_id,
-        start_date=start_date,
-        end_date=end_date,
-        sku=sku or None,
-        asin=asin or None,
-    )
-
     return {
         "stub": False,
         "region": region,
@@ -826,8 +995,107 @@ def refresh_daily_metrics(
         "chunks": [{"start_date": s, "end_date": e} for s, e in chunks],
         "report_ids": report_ids,
         "source_row_count": total_source_rows,
-        "rows_upserted": rows_upserted,
         "daily_row_count": len(final_rows),
+        "final_rows": final_rows,
+    }
+
+
+def _prepare_daily_metrics_from_shared_rows(
+    *,
+    region: str,
+    profile_id: str,
+    sku: str,
+    asin: str,
+    start_date: str,
+    end_date: str,
+    shared_rows: List[Dict[str, Any]],
+    shared_report_id: str,
+    shared_source_row_count: int,
+) -> Dict[str, Any]:
+    """
+    Build one identifier's normalized daily rows from a previously downloaded
+    shared DAILY report dataset.
+    """
+    start_date, end_date = _validate_history_window(start_date, end_date)
+
+    final_rows = _normalize_daily_rows(
+        shared_rows,
+        ads_region=region,
+        profile_id=profile_id,
+        sku=sku,
+        asin=asin,
+    )
+
+    return {
+        "stub": False,
+        "region": region,
+        "profile_id": profile_id,
+        "sku": sku,
+        "asin": asin,
+        "start_date": start_date,
+        "end_date": end_date,
+        "chunk_count": 1,
+        "chunks": [{"start_date": start_date, "end_date": end_date}],
+        "report_ids": [shared_report_id],
+        "source_row_count": shared_source_row_count,
+        "daily_row_count": len(final_rows),
+        "final_rows": final_rows,
+    }
+
+
+def refresh_daily_metrics(
+    region: str,
+    profile_id: str,
+    sku: str,
+    asin: str,
+    start_date: str,
+    end_date: str,
+    metrics_store,
+) -> Dict[str, Any]:
+    prepared = _prepare_daily_metrics_refresh(
+        region=region,
+        profile_id=profile_id,
+        sku=sku,
+        asin=asin,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    final_rows = prepared["final_rows"]
+    rows_upserted = metrics_store.upsert_rows(final_rows)
+
+    summary = metrics_store.get_summary(
+        ads_region=region,
+        profile_id=profile_id,
+        start_date=prepared["start_date"],
+        end_date=prepared["end_date"],
+        sku=sku or None,
+        asin=asin or None,
+    )
+
+    coverage = metrics_store.get_coverage(
+        ads_region=region,
+        profile_id=profile_id,
+        start_date=prepared["start_date"],
+        end_date=prepared["end_date"],
+        sku=sku or None,
+        asin=asin or None,
+    )
+
+    return {
+        "stub": prepared["stub"],
+        "region": prepared["region"],
+        "profile_id": prepared["profile_id"],
+        "sku": prepared["sku"],
+        "asin": prepared["asin"],
+        "start_date": prepared["start_date"],
+        "end_date": prepared["end_date"],
+        "chunk_count": prepared["chunk_count"],
+        "chunks": prepared["chunks"],
+        "report_ids": prepared["report_ids"],
+        "source_row_count": prepared["source_row_count"],
+        "rows_upserted": rows_upserted,
+        "daily_row_count": prepared["daily_row_count"],
         "coverage": {
             "expected_days": coverage.expected_days,
             "found_days": coverage.found_days,
@@ -920,3 +1188,340 @@ def refresh_daily_metrics_roll(
     }
 
     return refresh_result
+
+
+def refresh_daily_metrics_batch(
+    region: str,
+    profile_id: str,
+    items: List[Any],
+    metrics_store,
+) -> Dict[str, Any]:
+    """
+    Batch nightly refresh with two optimizations:
+    1. Identifiers are normalized and deduped.
+    2. Items sharing the same report window reuse the same downloaded report rows.
+    """
+    bootstrap_days = settings.ads_refresh_bootstrap_days
+    lag_days = settings.ads_refresh_lag_days
+
+    raw_batch_item_count = len(items)
+    normalized_items = _normalize_batch_items(items)
+
+    results: List[Dict[str, Any]] = []
+    initial_backfills = 0
+    daily_slices = 0
+    failed = 0
+    total_rows_upserted = 0
+
+    today = datetime.utcnow().date()
+    target_date = (today - timedelta(days=lag_days)).isoformat()
+
+    # Step 1: determine per-item windows using current DB state
+    work_items: List[Dict[str, Any]] = []
+    for item in normalized_items:
+        sku = item.get("sku", "")
+        asin = item.get("asin", "")
+
+        latest_stored_date = metrics_store.get_latest_stored_date(
+            ads_region=region,
+            profile_id=profile_id,
+            sku=sku or None,
+            asin=asin or None,
+        )
+
+        start_date, end_date = _compute_nightly_slice_window(
+            latest_stored_date=latest_stored_date,
+            bootstrap_days=bootstrap_days,
+            lag_days=lag_days,
+        )
+
+        mode = "daily_slice" if latest_stored_date else "initial_backfill"
+
+        work_items.append(
+            {
+                "sku": sku,
+                "asin": asin,
+                "mode": mode,
+                "latest_stored_date": latest_stored_date,
+                "start_date": start_date,
+                "end_date": end_date,
+                "target_date": target_date,
+            }
+        )
+
+    # Step 2: group by shared report window so we only fetch each unique report once
+    grouped_windows: dict[tuple[str, str], List[Dict[str, Any]]] = {}
+    for work_item in work_items:
+        key = (work_item["start_date"], work_item["end_date"])
+        grouped_windows.setdefault(key, []).append(work_item)
+
+    # Step 3: fetch shared reports in parallel, one per unique window
+    shared_reports: dict[tuple[str, str], Dict[str, Any]] = {}
+    window_failures: dict[tuple[str, str], str] = {}
+
+    max_workers = min(BATCH_MAX_WORKERS, max(1, len(grouped_windows)))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(
+                _fetch_shared_daily_rows_for_window,
+                profile_id=profile_id,
+                start_date=start_date,
+                end_date=end_date,
+                max_wait_seconds=DEFAULT_REPORT_MAX_WAIT_SECONDS,
+            ): (start_date, end_date)
+            for (start_date, end_date) in grouped_windows.keys()
+        }
+
+        for future in as_completed(future_map):
+            window_key = future_map[future]
+            try:
+                shared_reports[window_key] = future.result()
+            except Exception as exc:
+                window_failures[window_key] = str(exc)
+
+    # Step 4: process each work item from its shared downloaded rows
+    for work_item in work_items:
+        sku = work_item["sku"]
+        asin = work_item["asin"]
+        mode = work_item["mode"]
+        latest_stored_date = work_item["latest_stored_date"]
+        start_date = work_item["start_date"]
+        end_date = work_item["end_date"]
+        window_key = (start_date, end_date)
+
+        if window_key in window_failures:
+            failed += 1
+            results.append(
+                {
+                    "sku": sku,
+                    "asin": asin,
+                    "success": False,
+                    "targetDate": target_date,
+                    "error": window_failures[window_key],
+                }
+            )
+            continue
+
+        shared = shared_reports[window_key]
+
+        try:
+            prepared = _prepare_daily_metrics_from_shared_rows(
+                region=region,
+                profile_id=profile_id,
+                sku=sku,
+                asin=asin,
+                start_date=start_date,
+                end_date=end_date,
+                shared_rows=shared["rows"],
+                shared_report_id=shared["report_id"],
+                shared_source_row_count=shared["row_count"],
+            )
+
+            final_rows = prepared["final_rows"]
+            rows_upserted = metrics_store.upsert_rows(final_rows)
+            total_rows_upserted += rows_upserted
+
+            summary = metrics_store.get_summary(
+                ads_region=region,
+                profile_id=profile_id,
+                start_date=prepared["start_date"],
+                end_date=prepared["end_date"],
+                sku=sku or None,
+                asin=asin or None,
+            )
+
+            coverage = metrics_store.get_coverage(
+                ads_region=region,
+                profile_id=profile_id,
+                start_date=prepared["start_date"],
+                end_date=prepared["end_date"],
+                sku=sku or None,
+                asin=asin or None,
+            )
+
+            refresh_result = {
+                "stub": prepared["stub"],
+                "region": prepared["region"],
+                "profile_id": prepared["profile_id"],
+                "sku": prepared["sku"],
+                "asin": prepared["asin"],
+                "start_date": prepared["start_date"],
+                "end_date": prepared["end_date"],
+                "chunk_count": prepared["chunk_count"],
+                "chunks": prepared["chunks"],
+                "report_ids": prepared["report_ids"],
+                "source_row_count": prepared["source_row_count"],
+                "rows_upserted": rows_upserted,
+                "daily_row_count": prepared["daily_row_count"],
+                "coverage": {
+                    "expected_days": coverage.expected_days,
+                    "found_days": coverage.found_days,
+                    "complete": coverage.complete,
+                    "min_date": coverage.min_date,
+                    "max_date": coverage.max_date,
+                    "last_updated_at": coverage.last_updated_at,
+                },
+                "summary": {
+                    "impressions": summary.get("impressions", 0),
+                    "clicks": summary.get("clicks", 0),
+                    "spend": summary.get("spend", 0.0),
+                    "sales": summary.get("sales", 0.0),
+                    "orders": summary.get("orders", 0),
+                    "units": summary.get("units", 0),
+                    "acos": summary.get("acos"),
+                    "row_count": summary.get("row_count", 0),
+                },
+            }
+
+            if latest_stored_date:
+                daily_slices += 1
+            else:
+                initial_backfills += 1
+
+            results.append(
+                {
+                    "sku": sku,
+                    "asin": asin,
+                    "success": True,
+                    "mode": mode,
+                    "latest_stored_date_before_refresh": latest_stored_date,
+                    "startDate": start_date,
+                    "endDate": end_date,
+                    "targetDate": target_date,
+                    "rowsUpserted": rows_upserted,
+                    "refresh": refresh_result,
+                }
+            )
+
+        except Exception as exc:
+            failed += 1
+            results.append(
+                {
+                    "sku": sku,
+                    "asin": asin,
+                    "success": False,
+                    "targetDate": target_date,
+                    "error": str(exc),
+                }
+            )
+
+    results.sort(key=lambda r: ((r.get("asin") or ""), (r.get("sku") or "")))
+
+    return {
+        "summary": {
+            "batchItemsReceived": raw_batch_item_count,
+            "identifiersProcessed": len(normalized_items),
+            "initialBackfills": initial_backfills,
+            "dailySlices": daily_slices,
+            "failed": failed,
+            "rowsUpserted": total_rows_upserted,
+        },
+        "results": results,
+    }
+
+
+def _set_batch_job(job_id: str, updates: Dict[str, Any]) -> None:
+    with _batch_jobs_lock:
+        current = _batch_jobs.get(job_id, {}).copy()
+        current.update(updates)
+        _batch_jobs[job_id] = current
+
+
+def _run_refresh_batch_job(
+    *,
+    job_id: str,
+    region: str,
+    profile_id: str,
+    items: List[Any],
+    metrics_store,
+) -> None:
+    _set_batch_job(
+        job_id,
+        {
+            "status": "running",
+            "startedAt": _utc_now_iso(),
+        },
+    )
+
+    try:
+        result = refresh_daily_metrics_batch(
+            region=region,
+            profile_id=profile_id,
+            items=items,
+            metrics_store=metrics_store,
+        )
+
+        _set_batch_job(
+            job_id,
+            {
+                "status": "completed",
+                "completedAt": _utc_now_iso(),
+                "result": result,
+                "error": None,
+            },
+        )
+    except Exception as exc:
+        _set_batch_job(
+            job_id,
+            {
+                "status": "failed",
+                "completedAt": _utc_now_iso(),
+                "result": None,
+                "error": str(exc),
+            },
+        )
+
+
+def start_refresh_batch_job(
+    *,
+    region: str,
+    profile_id: str,
+    items: List[Any],
+    metrics_store,
+) -> Dict[str, Any]:
+    job_id = str(uuid.uuid4())
+    created_at = _utc_now_iso()
+
+    with _batch_jobs_lock:
+        _batch_jobs[job_id] = {
+            "jobId": job_id,
+            "status": "queued",
+            "createdAt": created_at,
+            "startedAt": None,
+            "completedAt": None,
+            "identity": {
+                "adsRegion": region,
+                "adsProfileId": profile_id,
+                "bootstrapDays": settings.ads_refresh_bootstrap_days,
+                "lagDays": settings.ads_refresh_lag_days,
+            },
+            "result": None,
+            "error": None,
+        }
+
+    worker = threading.Thread(
+        target=_run_refresh_batch_job,
+        kwargs={
+            "job_id": job_id,
+            "region": region,
+            "profile_id": profile_id,
+            "items": items,
+            "metrics_store": metrics_store,
+        },
+        daemon=True,
+    )
+    worker.start()
+
+    return {
+        "jobId": job_id,
+        "status": "queued",
+        "createdAt": created_at,
+    }
+
+
+def get_refresh_batch_job(job_id: str) -> Dict[str, Any]:
+    with _batch_jobs_lock:
+        if job_id not in _batch_jobs:
+            raise KeyError(job_id)
+        return _batch_jobs[job_id].copy()

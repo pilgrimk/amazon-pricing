@@ -8,6 +8,7 @@ from app.config import settings
 from app.ads_cache import cache_from_env, build_cache_key
 from app.ads_metrics import metrics_store_from_env
 from app import ads_client
+from app.models import AdsRefreshBatchRequest
 
 
 router = APIRouter(prefix="/v1/ads", tags=["ads"])
@@ -476,4 +477,103 @@ def ads_summary(
     return {
         "endpoint": "ads_summary",
         "payload": payload,
+    }
+
+
+@router.post("/refresh-batch")
+def refresh_ads_daily_metrics_batch(
+    request: Request,
+    adsRegion: str = "NA",
+    adsProfileId: str = "change_me",
+    payload: AdsRefreshBatchRequest | None = None,
+):
+    verify_key(request)
+
+    if payload is None or not payload.items:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide at least one batch item",
+        )
+
+    if payload.asyncMode:
+        try:
+            job = ads_client.start_refresh_batch_job(
+                region=adsRegion,
+                profile_id=adsProfileId,
+                items=payload.items,
+                metrics_store=metrics_store,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"ads async batch start failed: {exc}",
+            ) from exc
+
+        return {
+            "endpoint": "ads_refresh_batch",
+            "payload": {
+                "identity": {
+                    "adsRegion": adsRegion,
+                    "adsProfileId": adsProfileId,
+                    "bootstrapDays": settings.ads_refresh_bootstrap_days,
+                    "lagDays": settings.ads_refresh_lag_days,
+                    "asyncMode": True,
+                },
+                "job": job,
+            },
+        }
+
+    try:
+        result = ads_client.refresh_daily_metrics_batch(
+            region=adsRegion,
+            profile_id=adsProfileId,
+            items=payload.items,
+            metrics_store=metrics_store,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ads batch refresh failed: {exc}",
+        ) from exc
+
+    return {
+        "endpoint": "ads_refresh_batch",
+        "payload": {
+            "identity": {
+                "adsRegion": adsRegion,
+                "adsProfileId": adsProfileId,
+                "bootstrapDays": settings.ads_refresh_bootstrap_days,
+                "lagDays": settings.ads_refresh_lag_days,
+                "asyncMode": False,
+            },
+            "refresh": result,
+        },
+    }
+
+
+@router.get("/refresh-batch-status")
+def refresh_ads_daily_metrics_batch_status(
+    request: Request,
+    jobId: str,
+):
+    verify_key(request)
+
+    try:
+        job = ads_client.get_refresh_batch_job(jobId)
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown batch job: {jobId}",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ads batch status lookup failed: {exc}",
+        ) from exc
+
+    return {
+        "endpoint": "ads_refresh_batch_status",
+        "payload": {
+            "job": job,
+        },
     }
